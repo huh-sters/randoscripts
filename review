@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Usage:
+#   review <options>...
+#
+# Send staged files to ChatGTP for a code review before commit. Optionally include untracked files
+# You will need an OpenAI API key that you can generate here: https://platform.openai.com/account/api-keys
+# Then set the environment variable OPENAI_KEY with the key's value and this will just work as-is
+#
+# Depends on:
+#  curl
+
+# Exit immediately if a pipeline returns non-zero.
+set -o errexit
+
+# Allow the above trap be inherited by all functions in the script.
+set -o errtrace
+
+# Return value of a pipeline is the value of the last (rightmost) command to
+# exit with a non-zero status, or zero if all commands in the pipeline exit
+# successfully.
+set -o pipefail
+
+# Set $IFS to only newline and tab.
+IFS=$'\n\t'
+
+# This program's basename.
+_ME="$(basename "${0}")"
+
+# Deal with stuff
+escape_special_chars() {
+    local string="$1"
+    string="${string//\\/\\\\}"   # Escape backslashes
+    string="${string//\"/\\\"}"   # Escape double quotes
+    string="${string//\//\\/}"    # Escape forward slashes
+    string="${string//$'\n'/\\n}" # Escape newlines
+    string="${string//$'\r'/\\r}" # Escape carriage returns
+    string="${string//$'\t'/\\t}" # Escape tabs
+    echo "$string"
+}
+
+# Debug
+__DEBUG_COUNTER=0
+_debug() {
+  if ((${_USE_DEBUG:-0}))
+  then
+    __DEBUG_COUNTER=$((__DEBUG_COUNTER+1))
+    {
+      # Prefix debug message with "bug (U+1F41B)"
+      printf "🐛  %s " "${__DEBUG_COUNTER}"
+      "${@}"
+      printf "―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――\\n"
+    } 1>&2
+  fi
+}
+
+# Error Messages
+_exit_1() {
+  {
+    printf "%s " "$(tput setaf 1)!$(tput sgr0)"
+    "${@}"
+  } 1>&2
+  exit 1
+}
+
+_warn() {
+  {
+    printf "%s " "$(tput setaf 1)!$(tput sgr0)"
+    "${@}"
+  } 1>&2
+}
+
+# Help
+_print_help() {
+  cat <<HEREDOC
+
+Code reviewer
+
+ChatGPT based code reviewer
+
+Usage:
+  ${_ME} [--options] [<arguments>]
+  ${_ME} -h | --help
+
+Options:
+  -h --help  Display this help information.
+HEREDOC
+}
+
+# Parse Options
+_PRINT_HELP=0
+_USE_DEBUG=0
+_UNTRACKED=0
+
+__get_option_value() {
+  local __arg="${1:-}"
+  local __val="${2:-}"
+
+  if [[ -n "${__val:-}" ]] && [[ ! "${__val:-}" =~ ^- ]]
+  then
+    printf "%s\\n" "${__val}"
+  else
+    _exit_1 printf "%s requires a valid argument.\\n" "${__arg}"
+  fi
+}
+
+while ((${#}))
+do
+  __arg="${1:-}"
+  __val="${2:-}"
+
+  case "${__arg}" in
+    -h|--help)
+      _PRINT_HELP=1
+      ;;
+    --debug)
+      _USE_DEBUG=1
+      ;;
+    -u|--untracked)
+      _UNTRACKED=1
+      ;;
+    --endopts)
+      # Terminate option parsing.
+      break
+      ;;
+    -*)
+      _exit_1 printf "Unexpected option: %s\\n" "${__arg}"
+      ;;
+  esac
+
+  shift
+done
+
+# Program Functions
+_simple() {
+  repo_root=$(git rev-parse --show-toplevel)
+
+  printf "Performing code review for $repo_root...\\n"
+
+  untracked_files=""
+
+  if ((_UNTRACKED))
+  then
+    printf "Including untracked files.\\n"
+    # Get untracked files
+    untracked_files=$(git ls-files --others --exclude-standard --full-name)
+  fi
+
+  # Get staged files
+  staged_files=$(git diff --name-only --cached)
+  all_files="$staged_files"$'\n'"$untracked_files"
+
+  # Iterate over them
+  for file in $all_files; do
+    # file_contents=$(cat "$repo_root/$file" | sed -z 's/\n/\\n/g' | sed -z 's/"/\"/g' )
+    file_contents=$(cat "$repo_root/$file")
+
+    escaped_contents=$(escape_special_chars "$file_contents")
+
+    prompt="Review the code below and provide feedback on how to improve it.\\n\\n$escaped_contents\\n\\n"
+
+    response=$(curl https://api.openai.com/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $OPENAI_KEY" \
+      -d '{
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "'"$prompt"'"}],
+            "temperature": 0.7
+          }')
+
+    # Show results
+    generated_text=$(echo "$response" | jq -r '.choices[0].message.content')
+    echo "Review for $file:"
+    echo "$generated_text"
+  done
+}
+
+# Main
+_main() {
+  if ! command -v curl &> /dev/null
+  then
+    _exit_1 printf "curl not found.\\n"
+  fi
+  if ! command -v git &> /dev/null
+  then
+    _exit_1 printf "git not found.\\n"
+  fi
+  if ! command -v jq &> /dev/null
+  then
+    _exit_1 printf "jq not found.\\n"
+  fi
+  if [[ -z "$OPENAI_KEY" ]]; then
+    _exit_1 printf "OPENAI_KEY is not set.\\n"
+  fi
+  if ((_PRINT_HELP))
+  then
+    _print_help
+  else
+    _simple "$@"
+  fi
+}
+
+# Call `_main` after everything has been defined.
+_main "$@"
